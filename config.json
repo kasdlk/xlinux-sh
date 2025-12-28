@@ -1,0 +1,31 @@
+{
+  "general": {
+    "use_sudo": true,
+    "log_dir": "./logs",
+    "auto_backup": true
+  },
+  "scripts": {
+    "漏洞扫描": {
+      "description": "系统漏洞扫描工具",
+      "requires_sudo": true
+    },
+    "入侵分析": {
+      "description": "入侵入口点分析工具",
+      "requires_sudo": true
+    },
+    "后门检测": {
+      "description": "后门程序检测工具",
+      "requires_sudo": true
+    },
+    "web管理": {
+      "description": "Web服务器管理工具",
+      "requires_sudo": true
+    }
+  },
+  "paths": {
+    "nginx_conf": "/etc/nginx",
+    "web_root": "/var/www",
+    "log_dir": "/var/log"
+  }
+}
+
