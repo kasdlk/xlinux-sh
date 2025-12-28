@@ -1,0 +1,16 @@
+# 限流配置模块
+# 用于防止 DDoS 攻击和限制请求频率
+
+# 限制每个 IP 的连接数
+limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:10m;
+limit_conn_zone $server_name zone=conn_limit_per_server:10m;
+
+# 限制每个 IP 的请求速率
+limit_req_zone $binary_remote_addr zone=req_limit_per_ip:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=req_limit_strict:10m rate=1r/s;
+
+# 应用限流（在 server 块中使用）
+# limit_conn conn_limit_per_ip 10;
+# limit_req zone=req_limit_per_ip burst=20 nodelay;
+# limit_req zone=req_limit_strict burst=5 nodelay;
+

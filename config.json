@@ -17,8 +17,8 @@
       "description": "后门程序检测工具",
       "requires_sudo": true
     },
-    "web管理": {
-      "description": "Web服务器管理工具",
+    "网站管理": {
+      "description": "Nginx 多网站管理工具（支持主配置、模块配置、SSL证书等）",
       "requires_sudo": true
     }
   },

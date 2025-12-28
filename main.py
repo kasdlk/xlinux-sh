@@ -29,10 +29,10 @@ CONFIG_YAML = PROJECT_ROOT / "config.yaml"
 
 # 脚本目录映射
 SCRIPT_DIRS = {
-    "漏洞扫描": PROJECT_ROOT / "漏洞扫描",
-    "入侵分析": PROJECT_ROOT / "入侵分析",
-    "后门检测": PROJECT_ROOT / "后门检测",
-    "web管理": PROJECT_ROOT / "web管理",
+    "漏洞扫描": PROJECT_ROOT / "vulnerability_scan",
+    "入侵分析": PROJECT_ROOT / "intrusion_analysis",
+    "后门检测": PROJECT_ROOT / "backdoor_detection",
+    "网站管理": PROJECT_ROOT / "web_management",
 }
 
 # 颜色定义
@@ -93,6 +93,24 @@ def save_config(config: Dict):
         print_colored(f"✗ 保存配置失败: {e}", Colors.RED)
 
 
+def get_script_display_name(script_path: Path, category: str) -> str:
+    """获取脚本的友好显示名称"""
+    name = script_path.stem  # 去掉扩展名
+    
+    # 特殊处理：网站管理
+    if category == "网站管理" and name == "main":
+        return "Nginx 网站管理"
+    
+    # 根据文件名生成友好名称
+    name_mapping = {
+        "vulnerability_check": "系统漏洞扫描",
+        "1": "入侵入口分析",
+        "node": "后门程序检测",
+    }
+    
+    return name_mapping.get(name, name.replace("_", " ").title())
+
+
 def find_scripts() -> Dict[str, List[Path]]:
     """查找所有可执行脚本"""
     scripts = {}
@@ -102,14 +120,28 @@ def find_scripts() -> Dict[str, List[Path]]:
             continue
         
         script_list = []
-        # 查找.sh文件
-        for sh_file in dir_path.rglob("*.sh"):
-            if os.access(sh_file, os.X_OK) or True:  # 检查可执行权限
-                script_list.append(sh_file)
-        # 查找.py文件
-        for py_file in dir_path.rglob("*.py"):
-            if os.access(py_file, os.X_OK) or True:
-                script_list.append(py_file)
+        
+        # 特殊处理：网站管理目录只显示 main.py
+        if category == "网站管理":
+            main_py = dir_path / "main.py"
+            if main_py.exists():
+                script_list.append(main_py)
+        else:
+            # 其他目录：查找.sh文件（只查找直接子目录，不递归）
+            for sh_file in dir_path.glob("*.sh"):
+                if os.access(sh_file, os.X_OK) or True:
+                    script_list.append(sh_file)
+            # 查找子目录中的.sh文件（一级深度）
+            for subdir in dir_path.iterdir():
+                if subdir.is_dir():
+                    for sh_file in subdir.glob("*.sh"):
+                        if os.access(sh_file, os.X_OK) or True:
+                            script_list.append(sh_file)
+            # 查找.py文件（只查找直接子目录，不递归）
+            for py_file in dir_path.glob("*.py"):
+                # 排除 __init__.py 和内部模块文件
+                if py_file.name != "__init__.py" and os.access(py_file, os.X_OK) or True:
+                    script_list.append(py_file)
         
         if script_list:
             scripts[category] = sorted(script_list)
@@ -126,8 +158,10 @@ def run_script(script_path: Path, use_sudo: bool = False) -> bool:
     # 确保脚本有执行权限
     os.chmod(script_path, 0o755)
     
-    print_colored(f"\n正在运行: {script_path.name}", Colors.BLUE)
-    print_colored("-" * 60, Colors.CYAN)
+    # 获取显示名称（需要从 menu_items 中获取 category，这里简化处理）
+    display_name = get_script_display_name(script_path, "")
+    print_colored(f"\n🚀 正在运行: {display_name}", Colors.BLUE)
+    print_colored("=" * 60, Colors.CYAN)
     
     try:
         # 根据文件类型选择执行方式
@@ -168,7 +202,7 @@ def run_script(script_path: Path, use_sudo: bool = False) -> bool:
 def show_menu(scripts: Dict[str, List[Path]]):
     """显示主菜单"""
     print_colored("\n【主菜单】", Colors.BOLD + Colors.CYAN)
-    print_colored("-" * 60, Colors.CYAN)
+    print_colored("=" * 60, Colors.CYAN)
     
     menu_items = []
     index = 1
@@ -176,16 +210,15 @@ def show_menu(scripts: Dict[str, List[Path]]):
     for category, script_list in scripts.items():
         print_colored(f"\n{category}:", Colors.BOLD + Colors.YELLOW)
         for script in script_list:
-            rel_path = script.relative_to(PROJECT_ROOT)
-            print_colored(f"  [{index}] {script.name}", Colors.WHITE)
-            print_colored(f"      路径: {rel_path}", Colors.BLUE)
+            display_name = get_script_display_name(script, category)
+            print_colored(f"  [{index:2d}] {display_name}", Colors.WHITE)
             menu_items.append((script, category))
             index += 1
     
-    print_colored(f"\n  [{index}] 配置管理", Colors.WHITE)
-    print_colored(f"  [{index + 1}] 查看项目结构", Colors.WHITE)
-    print_colored(f"  [0] 退出", Colors.WHITE)
-    print_colored("-" * 60, Colors.CYAN)
+    print_colored(f"\n  [{index:2d}] 配置管理", Colors.WHITE)
+    print_colored(f"  [{index + 1:2d}] 查看项目结构", Colors.WHITE)
+    print_colored(f"  [ 0] 退出", Colors.WHITE)
+    print_colored("=" * 60, Colors.CYAN)
     
     return menu_items, index
 
@@ -278,7 +311,8 @@ def main():
         menu_items, last_index = show_menu(scripts)
         
         try:
-            choice = input("\n请选择功能 [0-{}]: ".format(last_index + 1)).strip()
+            max_choice = last_index + 1
+            choice = input(f"\n{Colors.BLUE}请选择功能 [0-{max_choice}]: {Colors.RESET}").strip()
             
             if choice == '0':
                 print_colored("\n感谢使用！再见！\n", Colors.GREEN)
@@ -299,14 +333,35 @@ def main():
                     if 0 <= script_index < len(menu_items):
                         script, category = menu_items[script_index]
                         
-                        # 检查是否需要sudo
-                        use_sudo = config.get('general', {}).get('use_sudo', True)
-                        if use_sudo and script.suffix == '.sh':
-                            # 对于shell脚本，询问是否需要sudo
-                            sudo_choice = input("是否需要sudo权限? (Y/n): ").strip().lower()
-                            use_sudo = sudo_choice != 'n'
-                        
-                        run_script(script, use_sudo=use_sudo)
+                        # 特殊处理：网站管理的 main.py 直接运行脚本
+                        if category == "网站管理" and script.name == "main.py":
+                            # 直接运行脚本，确保工作目录正确
+                            old_cwd = os.getcwd()
+                            try:
+                                os.chdir(script.parent)
+                                # 直接运行 Python 脚本
+                                result = subprocess.run(
+                                    [sys.executable, str(script)],
+                                    cwd=script.parent,
+                                    check=False
+                                )
+                                if result.returncode != 0 and result.returncode != 1:  # 1 可能是正常退出
+                                    print_colored(f"✗ 执行失败 (退出码: {result.returncode})", Colors.RED)
+                            except Exception as e:
+                                print_colored(f"✗ 执行失败: {e}", Colors.RED)
+                                import traceback
+                                traceback.print_exc()
+                            finally:
+                                os.chdir(old_cwd)
+                        else:
+                            # 检查是否需要sudo
+                            use_sudo = config.get('general', {}).get('use_sudo', True)
+                            if use_sudo and script.suffix == '.sh':
+                                # 对于shell脚本，询问是否需要sudo
+                                sudo_choice = input("是否需要sudo权限? (Y/n): ").strip().lower()
+                                use_sudo = sudo_choice != 'n'
+                            
+                            run_script(script, use_sudo=use_sudo)
                         input("\n按回车键继续...")
                     else:
                         print_colored("无效的选择", Colors.RED)

@@ -17,8 +17,16 @@ safety/
 ├── 后门检测/          # 后门检测工具
 │   └── node.sh       # Node.js后门验证脚本
 └── web管理/           # Web管理工具
-    └── nginx管理/     # Nginx管理工具
-        └── web.sh     # Nginx管理脚本
+    └── nginx管理/     # Nginx多网站管理工具
+        ├── nginx_manager.py  # Python主程序
+        ├── sites.json        # 网站配置文件
+        ├── configs/          # 生成的Nginx配置文件目录
+        ├── templates/        # 配置文件模板
+        ├── scripts/          # Shell脚本模块
+        │   ├── install.sh    # 安装脚本
+        │   └── ssl.sh        # SSL证书申请脚本
+        ├── nginx_manager.py  # Nginx管理主程序
+        └── README.md         # Nginx管理工具说明
 ```
 
 ## 快速开始
@@ -110,6 +118,35 @@ sudo ./vulnerability_check.sh
 **输出：**
 - 生成 `vulnerability_check_YYYYMMDD_HHMMSS/` 目录
 - 包含详细的漏洞检查报告
+
+### 4. Nginx 多网站管理工具 (nginx_manager.py)
+
+**功能：**
+- 多网站管理（添加、删除、启用、禁用）
+- 自动生成 Nginx 配置文件（保存在项目目录）
+- SSL 证书自动申请和配置（Let's Encrypt）
+- PHP 支持配置
+- 系统状态监控
+
+**使用方法：**
+```bash
+# 方式一：直接运行
+cd web管理/nginx管理
+python3 nginx_manager.py
+
+# 方式二：通过主程序
+cd /root/xlinux-sh
+python3 main.py
+# 选择 nginx管理 相关选项
+```
+
+**特点：**
+- 采用 Python + Shell + 配置文件混合开发模式
+- 配置文件保存在项目目录，便于版本控制
+- 支持多网站统一管理
+- 自动化的 SSL 证书申请和配置
+
+**详细说明：** 参见 `web管理/nginx管理/README.md`
 
 ## 使用建议
 

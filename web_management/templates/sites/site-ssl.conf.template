@@ -1,0 +1,62 @@
+# 网站 HTTPS 配置文件模板
+# 域名: {domain}
+# 生成时间: {generated_at}
+
+# HTTP 到 HTTPS 重定向
+server {
+    listen 80;
+    server_name {domain};
+    return 301 https://$server_name$request_uri;
+}
+
+# HTTPS 服务器配置
+server {
+    listen 443 ssl http2;
+    server_name {domain};
+
+    # SSL 证书
+    ssl_certificate {ssl_cert};
+    ssl_certificate_key {ssl_key};
+
+    # SSL 配置（包含 ssl.conf）
+    include /etc/nginx/conf.d/ssl.conf;
+
+    root {root_dir};
+    index index.html index.php;
+
+    # 日志配置
+    access_log /var/log/nginx/{domain}-access.log;
+    error_log /var/log/nginx/{domain}-error.log warn;
+
+    # 字符集
+    charset utf-8;
+
+    # 安全头
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # 主 location
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # PHP 支持
+{php_config}
+
+    # 禁止访问隐藏文件
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # 静态文件缓存
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+}
+
