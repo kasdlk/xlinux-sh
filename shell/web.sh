@@ -123,21 +123,51 @@ function ensure_nginx() {
 
 # 安装 acme.sh
 function ensure_acme() {
+    # 临时禁用严格模式，避免安装过程中的错误导致脚本退出
+    set +e
+    
     if [ ! -d "$HOME/.acme.sh" ]; then
         echo "${YELLOW}🔧 安装 acme.sh 中...${RESET}"
-        curl https://get.acme.sh | sh
-        source ~/.bashrc
+        # 使用临时禁用错误退出的方式安装
+        curl -s https://get.acme.sh | sh || {
+            echo "${RED}❌ acme.sh 安装失败${RESET}"
+            set -e
+            return 1
+        }
+        # 重新加载环境变量
+        if [ -f "$HOME/.bashrc" ]; then
+            source "$HOME/.bashrc" 2>/dev/null || true
+        fi
+        # 确保 acme.sh 在 PATH 中
+        if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+            export PATH="$HOME/.acme.sh:$PATH"
+        fi
         log "acme.sh 安装完成"
     fi
 
-    if ! ~/.acme.sh/acme.sh --list-account 2>/dev/null | grep -q "ACCOUNT_EMAIL"; then
-        echo "${YELLOW}📬 注册 acme.sh 账户 ($DEFAULT_EMAIL)...${RESET}"
-        ~/.acme.sh/acme.sh --register-account -m $DEFAULT_EMAIL
+    # 检查 acme.sh 是否可用
+    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
+        echo "${RED}❌ acme.sh 未正确安装${RESET}"
+        set -e
+        return 1
     fi
 
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-    ~/.acme.sh/acme.sh --install-cronjob
+    # 注册账户（如果需要）
+    if ! "$HOME/.acme.sh/acme.sh" --list-account 2>/dev/null | grep -q "ACCOUNT_EMAIL"; then
+        echo "${YELLOW}📬 注册 acme.sh 账户 ($DEFAULT_EMAIL)...${RESET}"
+        "$HOME/.acme.sh/acme.sh" --register-account -m "$DEFAULT_EMAIL" || {
+            echo "${YELLOW}⚠️ 账户注册可能已存在，继续执行...${RESET}"
+        }
+    fi
+
+    # 配置默认 CA 和升级
+    "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt 2>/dev/null || true
+    "$HOME/.acme.sh/acme.sh" --upgrade --auto-upgrade 2>/dev/null || true
+    "$HOME/.acme.sh/acme.sh" --install-cronjob 2>/dev/null || true
+    
+    # 恢复严格模式
+    set -e
+    return 0
 }
 
 # 配置防火墙
@@ -280,7 +310,12 @@ function apply_https() {
 
     if site_has_ssl "$domain"; then
         echo "${YELLOW}⚠️ 该域名已有 SSL 证书${RESET}"
-        return 1
+        read -p "${BLUE}是否重新申请替换现有证书？[y/N]: ${RESET}" replace_ssl
+        if [[ ! "$replace_ssl" =~ ^[Yy] ]]; then
+            echo "${YELLOW}已取消操作${RESET}"
+            return 0
+        fi
+        echo "${BLUE}🔄 将重新申请 SSL 证书...${RESET}"
     fi
 
     local conf_file="$NGINX_CONF_DIR/$domain"
@@ -301,7 +336,7 @@ function apply_https() {
     echo "${BLUE}🚀 开始为 $domain 申请 SSL 证书...${RESET}"
 
     while [ $retries -lt $max_retries ]; do
-        if ~/.acme.sh/acme.sh --issue -d "$domain" --webroot "$root_dir" 2>/dev/null; then
+        if "$HOME/.acme.sh/acme.sh" --issue -d "$domain" --webroot "$root_dir" 2>/dev/null; then
             break
         fi
         retries=$((retries+1))
@@ -319,7 +354,7 @@ function apply_https() {
 
     # 安装证书
     run_sudo mkdir -p "$SSL_DIR/$domain" || return 1
-    ~/.acme.sh/acme.sh --install-cert -d "$domain" \
+    "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" \
         --key-file "$SSL_DIR/$domain/key.pem" \
         --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
         --reloadcmd "sudo systemctl reload nginx" || return 1
@@ -327,8 +362,33 @@ function apply_https() {
     # 备份原配置
     backup_config "$conf_file" || return 1
     
-    # 读取现有配置内容（排除已有的 server 块）
-    local existing_config=$(run_sudo cat "$conf_file" 2>/dev/null | grep -v "^server {" | grep -v "^}" | grep -v "^# " || true)
+    # 从现有配置中提取 PHP 配置和其他 location 块（排除基本的 server 指令）
+    local php_config=""
+    local other_locations=""
+    
+    if [ -f "$conf_file" ]; then
+        # 提取 PHP location 块（更精确的提取）
+        php_config=$(run_sudo awk '/location[[:space:]]+~[[:space:]]+\\\.php/,/^[[:space:]]*\}/' "$conf_file" 2>/dev/null || true)
+        
+        # 提取其他 location 块（排除主 location / 和 acme-challenge 和 PHP location）
+        # 使用 awk 提取完整的 location 块
+        other_locations=$(run_sudo awk '
+            BEGIN { in_location=0; location_block="" }
+            /^[[:space:]]*location[[:space:]]+/ && !/location[[:space:]]+\// && !/location[[:space:]]+~[[:space:]]+\\\.php/ {
+                in_location=1
+                location_block=$0 "\n"
+                next
+            }
+            in_location {
+                location_block=location_block $0 "\n"
+                if (/^[[:space:]]*\}/) {
+                    print location_block
+                    location_block=""
+                    in_location=0
+                }
+            }
+        ' "$conf_file" 2>/dev/null || true)
+    fi
     
     # 重构配置：正确的 HTTPS 结构
     # 1. HTTP server (80端口) - 跳转到 HTTPS
@@ -366,15 +426,23 @@ server {
     location / {
         try_files \$uri \$uri/ =404;
     }
-$existing_config
+$(if [ -n "$php_config" ]; then echo "$php_config"; fi)
+$(if [ -n "$other_locations" ]; then echo "$other_locations"; fi)
 }
 EOF
 
-    # 使用统一的安全重载模板
-    if with_nginx_safe_reload "$conf_file" "为 $domain 添加 HTTPS"; then
+    # 测试并重载配置
+    if run_sudo nginx -t; then
+        run_sudo systemctl reload nginx || return 1
         echo "${GREEN}✅ HTTPS 配置成功: https://$domain ${RESET}"
+        log "为 $domain 添加 HTTPS"
     else
-        echo "${RED}❌ HTTPS 配置失败，已回滚${RESET}"
+        echo "${RED}❌ Nginx 配置测试失败，已回滚${RESET}"
+        # 恢复备份
+        local backup_file=$(ls -t "$conf_file.bak."* 2>/dev/null | head -1)
+        if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+            run_sudo cp "$backup_file" "$conf_file" || true
+        fi
         return 1
     fi
 }
@@ -573,6 +641,187 @@ function backup_config() {
     log "备份配置: $file -> ${file}.bak.$timestamp"
 }
 
+# 配置反向代理
+function configure_reverse_proxy() {
+    local domain="$1"
+    local conf_file="$NGINX_CONF_DIR/$domain"
+    
+    if [ ! -f "$conf_file" ]; then
+        echo "${RED}❌ 配置文件不存在: $conf_file${RESET}"
+        return 1
+    fi
+    
+    # 询问目标端口
+    read -p "${BLUE}请输入目标端口 (默认: 3000): ${RESET}" target_port
+    target_port=${target_port:-3000}
+    
+    # 验证端口号
+    if ! [[ "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
+        echo "${RED}❌ 无效的端口号: $target_port${RESET}"
+        return 1
+    fi
+    
+    # 备份配置
+    backup_config "$conf_file" || return 1
+    
+    # 创建临时文件
+    local temp_file=$(mktemp)
+    
+    # 读取配置文件
+    run_sudo cat "$conf_file" > "$temp_file" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    
+    # 生成反向代理配置
+    local proxy_config="    location / {
+        proxy_pass http://localhost:${target_port};
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }"
+    
+    # 创建临时 Python 脚本文件
+    local python_script=$(mktemp)
+    cat > "$python_script" <<'PYTHON_SCRIPT'
+import re
+import sys
+
+conf_content = sys.stdin.read()
+target_port = sys.argv[1]
+
+proxy_config = f"""    location / {{
+        proxy_pass http://localhost:{target_port};
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }}"""
+
+# 匹配 location / { ... } 块（支持嵌套大括号）
+def replace_location_block(content):
+    lines = content.split('\n')
+    result = []
+    i = 0
+    in_location = False
+    brace_count = 0
+    location_start = -1
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # 检测 location / { 开始
+        if re.match(r'^\s*location\s+/\s*\{', line) and not in_location:
+            in_location = True
+            location_start = i
+            brace_count = line.count('{') - line.count('}')
+            # 添加新的代理配置
+            result.append(proxy_config)
+            i += 1
+            continue
+        
+        if in_location:
+            # 计算大括号数量
+            brace_count += line.count('{') - line.count('}')
+            # 如果大括号平衡，说明 location 块结束
+            if brace_count == 0:
+                in_location = False
+            i += 1
+            continue
+        
+        # 不在 location 块中，保留原行
+        result.append(line)
+        i += 1
+    
+    return '\n'.join(result)
+
+new_content = replace_location_block(conf_content)
+print(new_content, end='')
+PYTHON_SCRIPT
+    
+    # 使用 Python 处理配置
+    local new_config=$(cat "$temp_file" | python3 "$python_script" "$target_port" 2>/dev/null)
+    
+    # 清理临时 Python 脚本
+    rm -f "$python_script"
+    
+    if [ -z "$new_config" ] || [ "$new_config" = "$(cat "$temp_file")" ]; then
+        echo "${YELLOW}⚠️ 未找到 location / 块，将在 HTTPS server 块中添加${RESET}"
+        # 如果没找到，在 HTTPS server 块中添加
+        new_config=$(run_sudo awk -v proxy_config="$proxy_config" '
+        BEGIN { 
+            in_https_server=0
+            location_added=0
+            in_location=0
+            brace_count=0
+        }
+        /listen[[:space:]]+443/ {
+            in_https_server=1
+            print
+            next
+        }
+        in_https_server && /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ {
+            in_location=1
+            brace_count=1
+            print proxy_config
+            next
+        }
+        in_location {
+            brace_count += gsub(/\{/, "&") - gsub(/\}/, "&")
+            if (brace_count == 0) {
+                in_location=0
+            }
+            next
+        }
+        in_https_server && /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ && !location_added {
+            print proxy_config
+            location_added=1
+            next
+        }
+        {
+            print
+        }
+        ' "$temp_file" 2>/dev/null)
+    fi
+    
+    # 将新配置写回文件
+    echo "$new_config" | run_sudo tee "$conf_file" >/dev/null || {
+        rm -f "$temp_file"
+        echo "${RED}❌ 写入配置文件失败${RESET}"
+        return 1
+    }
+    
+    rm -f "$temp_file"
+    
+    # 测试配置
+    echo "${BLUE}检测配置...${RESET}"
+    if run_sudo nginx -t; then
+        echo "${GREEN}✅ 配置测试通过${RESET}"
+        read -p "${BLUE}是否立即重载 Nginx？[Y/n]: ${RESET}" reload_choice
+        if [[ ! "$reload_choice" =~ ^[Nn] ]]; then
+            run_sudo systemctl reload nginx || return 1
+            echo "${GREEN}✅ Nginx 配置已重载，反向代理已配置到 http://localhost:${target_port}${RESET}"
+            log "为 $domain 配置反向代理到端口 $target_port"
+        fi
+    else
+        echo "${RED}❌ 配置测试失败${RESET}"
+        read -p "${YELLOW}是否恢复备份？[Y/n]: ${RESET}" restore_choice
+        if [[ ! "$restore_choice" =~ ^[Nn] ]]; then
+            local backup_file=$(ls -t "$conf_file.bak."* 2>/dev/null | head -1)
+            if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+                run_sudo cp "$backup_file" "$conf_file" || return 1
+                echo "${GREEN}✅ 已恢复备份配置${RESET}"
+            fi
+        fi
+        return 1
+    fi
+}
+
 # 查看配置
 function view_config() {
     local domain="$1"
@@ -623,9 +872,10 @@ function view_config() {
         echo "3) 查看访问日志 (最近 100 行)"
         echo "4) 查看错误日志 (实时)"
         echo "5) 查看错误日志 (最近 100 行)"
-        echo "6) 返回上级菜单"
+        echo "6) 配置反向代理 (替换 location /)"
+        echo "7) 返回上级菜单"
         echo "${BLUE}==============================${RESET}"
-        read -p "${BOLD}请选择操作 [1-6]: ${RESET}" config_choice
+        read -p "${BOLD}请选择操作 [1-7]: ${RESET}" config_choice
         
         case $config_choice in
             1)
@@ -683,6 +933,10 @@ function view_config() {
                 read -p "${BLUE}按回车键继续...${RESET}" wait
                 ;;
             6)
+                configure_reverse_proxy "$domain"
+                read -p "${BLUE}按回车键继续...${RESET}" wait
+                ;;
+            7)
                 return 0
                 ;;
             *)
@@ -976,8 +1230,11 @@ function site_management() {
 
         case $choice in
             1) 
-                ensure_acme
-                apply_https "$domain"
+                if ensure_acme; then
+                    apply_https "$domain"
+                else
+                    echo "${RED}❌ acme.sh 安装或配置失败，无法申请证书${RESET}"
+                fi
                 read -p "${BLUE}按回车键继续...${RESET}" wait
                 ;;
             2) 
