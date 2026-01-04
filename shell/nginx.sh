@@ -16,6 +16,10 @@ SSL_DIR="/etc/nginx/ssl"
 LOG_FILE="/var/log/nginx_manager.log"
 DEFAULT_EMAIL="admin@yourdomain.com"  # ← 修改为你的邮箱
 
+# 获取真实用户家目录，防止 sudo 运行时路径偏移
+REAL_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || echo "$HOME")
+ACME_BIN="$REAL_HOME/.acme.sh/acme.sh"
+
 # ======================== 初始化 ========================
 # 彩色输出定义
 RED=$(tput setaf 1)
@@ -28,16 +32,11 @@ RESET=$(tput sgr0)
 # ======================== 核心执行层 ========================
 # 统一 sudo 执行器（权限可控）
 run_sudo() {
-    # 使用 set +e 临时禁用严格模式，因为某些命令可能返回非零但可接受
     set +e
-    sudo "$@" 2>/dev/null
+    sudo "$@"
     local result=$?
     set -e
-    if [ $result -ne 0 ]; then
-        log_error "命令执行失败: $*"
-        return 1
-    fi
-    return 0
+    return $result
 }
 
 # 统一命令执行器（带错误检查）
@@ -70,7 +69,7 @@ function log() {
 # 检查依赖
 function check_deps() {
     local missing=()
-    for cmd in curl sudo nginx; do
+    for cmd in curl sudo nginx openssl; do
         if ! command -v $cmd &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -110,36 +109,51 @@ function site_has_ssl() {
 }
 
 # ======================== 核心功能 ========================
-# 安装 Nginx
+# 确保 Nginx 运行
 function ensure_nginx() {
-    if ! command -v nginx &>/dev/null; then
-        echo "${YELLOW}🔧 安装 Nginx 中...${RESET}"
-        run_sudo apt update || return 1
-        run_sudo apt install nginx -y || return 1
-        run_sudo systemctl enable nginx || return 1
-        log "Nginx 安装完成"
+    if ! systemctl is-active --quiet nginx; then
+        echo "${YELLOW}🔧 启动 Nginx...${RESET}"
+        run_sudo systemctl enable --now nginx
     fi
 }
 
 # 安装 acme.sh
 function ensure_acme() {
-    if [ ! -d "$HOME/.acme.sh" ]; then
-        echo "${YELLOW}🔧 安装 acme.sh 中...${RESET}"
+    if [ ! -f "$ACME_BIN" ]; then
+        echo "${YELLOW}🔧 安装 acme.sh...${RESET}"
         curl https://get.acme.sh | sh
-        source ~/.bashrc
-        log "acme.sh 安装完成"
+        "$ACME_BIN" --register-account -m "$DEFAULT_EMAIL"
     fi
-
-    if ! ~/.acme.sh/acme.sh --list-account 2>/dev/null | grep -q "ACCOUNT_EMAIL"; then
-        echo "${YELLOW}📬 注册 acme.sh 账户 ($DEFAULT_EMAIL)...${RESET}"
-        ~/.acme.sh/acme.sh --register-account -m $DEFAULT_EMAIL
-    fi
-
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-    ~/.acme.sh/acme.sh --install-cronjob
 }
-
+# 自动检测 PHP-FPM Socket
+detect_php_fpm_socket() {
+    local socket
+    socket=$(find /run/php/ -name "php*-fpm.sock" | sort -V | tail -n 1)
+    if [ -z "$socket" ]; then
+        echo "127.0.0.1:9000" # 回退到 TCP
+    else
+        echo "unix:$socket"
+    fi
+}
+# 安全重载：失败则回滚
+with_nginx_safe_reload() {
+    local conf_file="$1"
+    local action_desc="$2"
+    if run_sudo nginx -t; then
+        run_sudo systemctl reload nginx
+        log "成功: $action_desc"
+        return 0
+    else
+        log_error "配置测试失败，尝试回滚: $action_desc"
+        local latest_bak
+        latest_bak=$(ls -t "${conf_file}.bak."* 2>/dev/null | head -1 || true)
+        if [ -n "$latest_bak" ]; then
+            run_sudo cp "$latest_bak" "$conf_file"
+            echo "${YELLOW}⚠️ 已恢复备份: $latest_bak${RESET}"
+        fi
+        return 1
+    fi
+}
 # 配置防火墙
 function ensure_firewall() {
     if command -v ufw &>/dev/null; then
@@ -160,108 +174,38 @@ function ensure_firewall() {
 
 # 添加网站
 function add_site() {
-    while true; do
-        read -p "${BLUE}请输入主域名 (如 example.com): ${RESET}" domain
-        if [[ "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-            break
-        else
-            echo "${RED}❌ 非法域名格式，请重新输入${RESET}"
-        fi
-    done
+    read -p "${BLUE}请输入域名 (如 example.com): ${RESET}" domain
+    [[ ! "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && { echo "${RED}格式错误${RESET}"; return 1; }
+    
+    local root_dir="$WEB_ROOT_BASE/$domain"
+    local conf_file="$NGINX_CONF_DIR/$domain"
+    
+    site_exists "$domain" && { echo "${YELLOW}站点已存在${RESET}"; return 1; }
 
-    root_dir="$WEB_ROOT_BASE/$domain"
-    conf_file="$NGINX_CONF_DIR/$domain"
+    run_sudo mkdir -p "$root_dir"
+    run_sudo chown www-data:www-data "$root_dir"
+    echo "<h1>Welcome to $domain</h1>" | run_sudo tee "$root_dir/index.html" >/dev/null
 
-    # 检查是否已存在
-    if [ -f "$conf_file" ]; then
-        echo "${YELLOW}⚠️ 该域名配置已存在${RESET}"
-        return 1
-    fi
-
-    # 创建网站目录
-    run_sudo mkdir -p "$root_dir" || return 1
-    run_sudo chown -R www-data:www-data "$root_dir" || return 1
-    run_sudo chmod 755 "$root_dir" || return 1
-
-    # 默认首页
-    if [ ! -f "$root_dir/index.html" ]; then
-        run_sudo tee "$root_dir/index.html" >/dev/null <<EOF
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Welcome to $domain</title>
-    <style>
-        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-        h1 { color: #4CAF50; }
-    </style>
-</head>
-<body>
-    <h1>Welcome to $domain</h1>
-    <p>This site is powered by nginx-manager</p>
-</body>
-</html>
-EOF
-    fi
-
-    # 检查是否需要 PHP
-    read -p "${BLUE}是否需要 PHP 支持？[y/N]: ${RESET}" need_php
-    php_config=""
+    read -p "${BLUE}需要 PHP 支持吗？[y/N]: ${RESET}" need_php
+    local php_block=""
     if [[ "$need_php" =~ ^[Yy] ]]; then
-        # 自动检测 PHP-FPM socket
-        local php_socket=$(detect_php_fpm_socket)
-        if [[ "$php_socket" =~ ^unix: ]]; then
-            php_config=$(cat <<EOF
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass $php_socket;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        include fastcgi_params;
-    }
-EOF
-)
-        else
-            # TCP 模式
-            php_config=$(cat <<EOF
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass $php_socket;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        include fastcgi_params;
-    }
-EOF
-)
-        fi
+        local socket
+        socket=$(detect_php_fpm_socket)
+        php_block="location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass $socket; }"
     fi
 
-    # 生成 Nginx 配置
     run_sudo tee "$conf_file" >/dev/null <<EOF
 server {
     listen 80;
     server_name $domain;
     root $root_dir;
     index index.html index.php;
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-$php_config
+    location / { try_files \$uri \$uri/ =404; }
+    $php_block
 }
 EOF
-
-    # 启用网站
-    run_sudo ln -sf "$conf_file" "$NGINX_ENABLED_DIR/" || return 1
-    
-    if run_sudo nginx -t; then
-        run_sudo systemctl reload nginx || return 1
-        echo "${GREEN}✅ 网站添加成功: http://$domain ${RESET}"
-        log "添加网站: $domain"
-    else
-        echo "${RED}❌ Nginx 配置测试失败，请检查${RESET}"
-        run_sudo rm -f "$conf_file" "$NGINX_ENABLED_DIR/$domain"
-        return 1
-    fi
+    run_sudo ln -sf "$conf_file" "$NGINX_ENABLED_DIR/"
+    with_nginx_safe_reload "$conf_file" "添加站点 $domain"
 }
 
 # 申请 HTTPS 证书（重构：正确的配置结构）
@@ -295,78 +239,45 @@ function apply_https() {
     fi
 
     # 申请证书
-    local retries=0
-    local max_retries=3
-
-    echo "${BLUE}🚀 开始为 $domain 申请 SSL 证书...${RESET}"
-
-    while [ $retries -lt $max_retries ]; do
-        if ~/.acme.sh/acme.sh --issue -d "$domain" --webroot "$root_dir" 2>/dev/null; then
-            break
-        fi
-        retries=$((retries+1))
-        echo "${YELLOW}⚠️ 证书申请失败 (尝试 $retries/$max_retries)，等待 10 秒...${RESET}"
-        sleep 10
-    done
-
-    if [ $retries -eq $max_retries ]; then
-        echo "${RED}❌ 证书申请失败，请检查:${RESET}"
-        echo "1. 域名是否解析到本机"
-        echo "2. 80 端口是否开放"
-        echo "3. 防火墙是否允许 HTTP 流量"
+    echo "${BLUE}🔐 申请 SSL 证书...${RESET}"
+    if ! "$ACME_BIN" --issue -d "$domain" --webroot "$root_dir" --force; then
+        echo "${RED}证书申请失败，请确保 80 端口可访问且解析正确${RESET}"
         return 1
     fi
 
     # 安装证书
-    run_sudo mkdir -p "$SSL_DIR/$domain" || return 1
-    ~/.acme.sh/acme.sh --install-cert -d "$domain" \
+    run_sudo mkdir -p "$SSL_DIR/$domain"
+    "$ACME_BIN" --install-cert -d "$domain" \
         --key-file "$SSL_DIR/$domain/key.pem" \
         --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
-        --reloadcmd "sudo systemctl reload nginx" || return 1
+        --reloadcmd "sudo systemctl reload nginx"
 
     # 备份原配置
-    backup_config "$conf_file" || return 1
+    backup_config "$NGINX_CONF_DIR/$domain"
     
-    # 读取现有配置内容（排除已有的 server 块）
-    local existing_config=$(run_sudo cat "$conf_file" 2>/dev/null | grep -v "^server {" | grep -v "^}" | grep -v "^# " || true)
-    
-    # 重构配置：正确的 HTTPS 结构
-    # 1. HTTP server (80端口) - 跳转到 HTTPS
-    # 2. HTTPS server (443端口) - 实际服务
-    run_sudo tee "$conf_file" >/dev/null <<EOF
-# HTTP server - 跳转到 HTTPS
+    # 重新生成含 SSL 的配置
+    run_sudo tee "$NGINX_CONF_DIR/$domain" >/dev/null <<EOF
 server {
     listen 80;
     server_name $domain;
-    
-    # 允许 Let's Encrypt 验证
-    location /.well-known/acme-challenge/ {
-        root $root_dir;
-    }
-    
-    # 其他请求跳转到 HTTPS
-    location / {
-        return 301 https://\$server_name\$request_uri;
-    }
+    location /.well-known/acme-challenge/ { root $root_dir; }
+    location / { return 301 https://\$host\$request_uri; }
 }
-
-# HTTPS server - 实际服务
 server {
     listen 443 ssl http2;
     server_name $domain;
-
-    ssl_certificate     $SSL_DIR/$domain/fullchain.pem;
-    ssl_certificate_key $SSL_DIR/$domain/key.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-
     root $root_dir;
     index index.html index.php;
 
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-$existing_config
+    ssl_certificate $SSL_DIR/$domain/fullchain.pem;
+    ssl_certificate_key $SSL_DIR/$domain/key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+
+    location / { try_files \$uri \$uri/ =404; }
 }
 EOF
 
@@ -568,9 +479,9 @@ function delete_site() {
 # 备份配置
 function backup_config() {
     local file=$1
-    local timestamp=$(date +%Y%m%d-%H%M%S)
-    run_sudo cp "$file" "${file}.bak.$timestamp" || return 1
-    log "备份配置: $file -> ${file}.bak.$timestamp"
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    run_sudo cp "$file" "${file}.bak.$timestamp"
 }
 
 # 查看配置
