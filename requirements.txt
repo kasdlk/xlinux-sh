@@ -1,8 +1,0 @@
-# Python依赖包
-# 基础包（Python标准库，无需安装）
-# json - 标准库
-# pathlib - 标准库（Python 3.4+）
-
-# 可选依赖
-PyYAML>=5.4.1  # 用于YAML配置文件支持（可选）
-
